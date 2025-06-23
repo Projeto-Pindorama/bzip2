@@ -21,7 +21,7 @@ import (
 	"sync"
 
 	"github.com/dsnet/compress/bzip2"
-	"rsc.io/getopt"
+	"pindorama.net.br/getopt"
 )
 
 // Command-line flags
@@ -59,7 +59,7 @@ func exit(msg string) {
 
 // setByUser checks whether a specific flag was explicitly set by the user
 func setByUser(name string) (isSet bool) {
-	flag.Visit(func(f *flag.Flag) {
+	getopt.Visit(func(f *flag.Flag) {
 		if f.Name == name {
 			isSet = true
 		}
@@ -190,7 +190,7 @@ func processFile(inFilePath string) error {
 	pr, pw := io.Pipe()
 
 	var logMu sync.Mutex
-	
+
 	// File decompression
 	if *decompress {
 		go func() {
@@ -329,7 +329,7 @@ func main() {
 		explanation := fmt.Sprintf("set block size to %dk", (i * 100))
 		if i == 9 {
 			explanation += " (default)"
-		}		
+		}
 		flag.BoolFunc(strconv.Itoa(i), explanation, func(string) error {
 			*level = levelValue
 			return nil
