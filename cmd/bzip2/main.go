@@ -1,7 +1,7 @@
 // Copyright (c) 2010, Andrei Vieru. All rights reserved.
 // Copyright (c) 2021, Pedro Albanese. All rights reserved.
 // Copyright (c) 2025: Pindorama
-//         Luiz Antônio Rangel (takusuman)
+//		Luiz Antônio Rangel (takusuman)
 // All rights reserved.
 // Use of this source code is governed by a ISC license that
 // can be found in the LICENSE file.
@@ -14,12 +14,14 @@ import (
 	"log"
 	"os"
 	"path"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/dsnet/compress/bzip2"
-	"rsc.io/getopt"
+	"pindorama.net.br/getopt"
 )
 
 // Command-line flags
@@ -30,11 +32,12 @@ var (
 	help       = flag.Bool("h", false, "print this help message")
 	verbose    = flag.Bool("v", false, "be verbose")
 	keep       = flag.Bool("k", false, "keep original files unchanged")
-	suffix     = flag.String("s", "bz2", "use provided suffix on compressed files")
+	suffix     = flag.String("S", "bz2", "use provided suffix on compressed files")
 	cores      = flag.Int("cores", 0, "number of cores to use for parallelization")
 	test       = flag.Bool("t", false, "test compressed file integrity")
 	compress   = flag.Bool("z", true, "compress file(s)")
 	level      = flag.Int("l", 9, "compression level (1 = fastest, 9 = best)")
+	recursive  = flag.Bool("r", false, "operate recursively on directories")
 
 	stdin bool // Indicates if reading from standard input
 )
@@ -56,7 +59,7 @@ func exit(msg string) {
 
 // setByUser checks whether a specific flag was explicitly set by the user
 func setByUser(name string) (isSet bool) {
-	flag.Visit(func(f *flag.Flag) {
+	getopt.Visit(func(f *flag.Flag) {
 		if f.Name == name {
 			isSet = true
 		}
@@ -68,7 +71,7 @@ func setByUser(name string) (isSet bool) {
 // Returns an error if any issue occurs during processing
 func processFile(inFilePath string) error {
 	// Checks for conflicting flags
-	if *stdout == true && setByUser("s") == true {
+	if *stdout == true && setByUser("S") == true {
 		return fmt.Errorf("stdout set, suffix not used")
 	}
 	if *stdout == true && *force == true {
@@ -116,7 +119,7 @@ func processFile(inFilePath string) error {
 		if *stdout != true {
 			return fmt.Errorf("reading from stdin, can write only to stdout")
 		}
-		if setByUser("s") == true {
+		if setByUser("S") == true {
 			return fmt.Errorf("reading from stdin, suffix not needed")
 		}
 		stdin = true
@@ -139,20 +142,30 @@ func processFile(inFilePath string) error {
 			}
 
 			// Generates output file name
+			fext := ("." + *suffix)
 			if *decompress {
 				outFileDir, outFileName := path.Split(inFilePath)
-				if strings.HasSuffix(outFileName, "."+*suffix) {
-					if len(outFileName) > len("."+*suffix) {
+				if strings.HasSuffix(outFileName, fext) {
+					if len(outFileName) > len(fext) {
 						nstr := strings.SplitN(outFileName, ".", len(outFileName))
 						estr := strings.Join(nstr[0:len(nstr)-1], ".")
-						outFilePath = outFileDir + estr
+						outFilePath = (outFileDir + estr)
 					} else {
-						return fmt.Errorf("can't strip suffix .%s from file %s", *suffix, inFilePath)
+						return fmt.Errorf("can't strip suffix .%s from file %s",
+							*suffix, inFilePath)
 					}
 				} else {
-					return fmt.Errorf("file %s doesn't have suffix .%s", inFilePath, *suffix)
+					fmt.Fprintf(os.Stderr, "file %s doesn't have suffix .%s\n",
+						inFilePath, *suffix)
+					fmt.Fprintf(os.Stderr, "Can't guess original name for %s -- using %s.out\n",
+						inFilePath, inFilePath)
+					outFilePath = (outFileDir + outFileName + ".out")
 				}
 			} else {
+				if strings.HasSuffix(inFilePath, fext) {
+					return fmt.Errorf("Input file %s already has .%s suffix.",
+						inFilePath, *suffix)
+				}
 				outFilePath = inFilePath + "." + *suffix
 			}
 
@@ -176,6 +189,8 @@ func processFile(inFilePath string) error {
 	// Creates a pipe for communication between goroutines
 	pr, pw := io.Pipe()
 
+	var logMu sync.Mutex
+
 	// File decompression
 	if *decompress {
 		go func() {
@@ -191,10 +206,6 @@ func processFile(inFilePath string) error {
 					return
 				}
 				defer inFile.Close()
-			}
-
-			if *verbose {
-				fmt.Fprintf(os.Stderr, "%s: ", inFile.Name())
 			}
 
 			_, err = io.Copy(pw, inFile)
@@ -230,7 +241,9 @@ func processFile(inFilePath string) error {
 		}
 
 		if *verbose && !*stdout {
-			fmt.Fprintln(os.Stderr, "done")
+			logMu.Lock()
+			fmt.Fprintf(os.Stderr, "%s: done\n", inFilePath)
+			logMu.Unlock()
 		}
 	} else { // File compression
 		go func() {
@@ -255,10 +268,6 @@ func processFile(inFilePath string) error {
 			}
 			defer z.Close()
 
-			if *verbose {
-				fmt.Fprintf(os.Stderr, "%s: ", inFile.Name())
-			}
-
 			_, err = io.Copy(z, inFile)
 			if err != nil {
 				pw.CloseWithError(err)
@@ -266,12 +275,18 @@ func processFile(inFilePath string) error {
 			}
 
 			if *verbose {
-				bz := z
-				compratio := (float64(bz.InputOffset) / float64(bz.OutputOffset))
-				fmt.Fprintf(os.Stderr, "%6.3f:1, %6.3f bits/byte, %5.2f%% saved, %d in, %d out.\n",
-					compratio, ((1 / compratio) * 8),
+				var buf strings.Builder
+				compratio := (float64(z.InputOffset) / float64(z.OutputOffset))
+				fmt.Fprintf(&buf, "%s: %6.3f:1, %6.3f bits/byte, %5.2f%% saved, %d in, %d out.\n",
+					inFilePath,
+					compratio,
+					((1 / compratio) * 8),
 					(100 * (1 - (1 / compratio))),
-					bz.InputOffset, bz.OutputOffset)
+					z.InputOffset, z.OutputOffset)
+
+				logMu.Lock()
+				fmt.Fprint(os.Stderr, buf.String())
+				logMu.Unlock()
 			}
 		}()
 
@@ -310,11 +325,15 @@ func processFile(inFilePath string) error {
 func main() {
 	// Configure flags for compression levels (1–9)
 	for i := 1; i <= 9; i++ {
+		levelValue := i
 		explanation := fmt.Sprintf("set block size to %dk", (i * 100))
 		if i == 9 {
 			explanation += " (default)"
 		}
-		_ = flag.Bool(strconv.Itoa(i), false, explanation)
+		flag.BoolFunc(strconv.Itoa(i), explanation, func(string) error {
+			*level = levelValue
+			return nil
+		})
 	}
 
 	// Alias short flags with their long counterparts.
@@ -325,6 +344,7 @@ func main() {
 		"d", "decompress",
 		"f", "force",
 		"k", "keep",
+		"r", "recursive",
 		"t", "test",
 		"v", "verbose",
 		"z", "compress",
@@ -343,7 +363,7 @@ func main() {
 			}
 		}
 	}
-	
+
 	// Validate compression level
 	if *level < 1 || *level > 9 {
 		exit("invalid compression level: must be between 1 and 9")
@@ -360,30 +380,96 @@ func main() {
 		exit("invalid number of cores")
 	}
 
-	// From 'go doc runtime.GOMAXPROCS':
-	// "It defaults to the value of runtime.NumCPU.
-	// If n < 1, it does not change the current setting."
-	// In fact, if the default value of cores is zero, it
-	// will use all the cores of the machine.
-	runtime.GOMAXPROCS(*cores)
-
 	// Get list of files to process
 	files := flag.Args()
 	if len(files) == 0 {
 		files = []string{"-"} // default to stdin
 	}
 
-	// Process each file
-	hasErrors := false
-	for _, file := range files {
-		err := processFile(file)
-		if err != nil {
-			log.Printf("%s: %v", file, err)
-			hasErrors = true
-		}
+	// From 'go doc runtime.GOMAXPROCS':
+	// "It defaults to the value of runtime.NumCPU.
+	// If n < 1, it does not change the current setting."
+	// In fact, if the default value of cores is zero, it
+	// will use all the cores of the machine.
+	if *cores <= 0 {
+		*cores = runtime.NumCPU()
 	}
 
-	// Exit with error code if any failures occurred
+	// Process each file
+	hasErrors := false
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, *cores)
+
+	for _, file := range files {
+		file := file
+		wg.Add(1)
+
+		go func(f string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			if file == "-" {
+				err := processFile(file)
+				if err != nil {
+					log.Printf("%s: %v", file, err)
+					hasErrors = true
+				}
+				return
+			}
+
+			info, err := os.Stat(file)
+			if err != nil {
+				log.Printf("%s: %v", file, err)
+				hasErrors = true
+				return
+			}
+
+			if info.IsDir() {
+				if *recursive {
+					err = filepath.Walk(f, func(path string, fi os.FileInfo, err error) error {
+						if err != nil {
+							mu.Lock()
+							log.Printf("%s: %v", path, err)
+							hasErrors = true
+							mu.Unlock()
+							return nil
+						}
+						if !fi.IsDir() {
+							if err := processFile(path); err != nil {
+								mu.Lock()
+								log.Printf("%s: %v", path, err)
+								hasErrors = true
+								mu.Unlock()
+							}
+						}
+						return nil
+					})
+					if err != nil {
+						mu.Lock()
+						log.Printf("%s: %v", f, err)
+						hasErrors = true
+						mu.Unlock()
+					}
+				} else {
+					mu.Lock()
+					log.Printf("%s is a directory (use -r to process recursively)", f)
+					hasErrors = true
+					mu.Unlock()
+				}
+			} else {
+				if err := processFile(f); err != nil {
+					mu.Lock()
+					log.Printf("%s: %v", f, err)
+					hasErrors = true
+					mu.Unlock()
+				}
+			}
+		}(file)
+	}
+
+	wg.Wait()
 	if hasErrors {
 		os.Exit(1)
 	}
